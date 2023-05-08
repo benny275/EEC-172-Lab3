@@ -1,0 +1,892 @@
+// Standard includes
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+
+// Driverlib includes
+#include "hw_types.h"
+#include "hw_ints.h"
+#include "hw_nvic.h"
+#include "hw_memmap.h"
+#include "hw_common_reg.h"
+#include "hw_apps_rcm.h"
+#include "hw_ints.h"
+#include "spi.h"
+#include "rom.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "prcm.h"
+#include "uart.h"
+#include "interrupt.h"
+#include "prcm.h"
+#include "gpio.h"
+#include "systick.h"
+
+
+// Common interface includes
+#include "uart_if.h"
+#include "pin_mux_config.h"
+#include "Adafruit_SSD1351.h"
+#include "Adafruit_GFX.h"
+
+
+#define APPLICATION_VERSION     "1.4.0"
+//*****************************************************************************
+//
+// Application Master/Slave mode selector macro
+//
+// MASTER_MODE = 1 : Application in master mode
+// MASTER_MODE = 0 : Application in slave mode
+//
+//*****************************************************************************
+#define MASTER_MODE      0
+
+#define SPI_IF_BIT_RATE  100000
+#define TR_BUFF_SIZE     100
+
+#define MASTER_MSG       "This is CC3200 SPI Master Application\n\r"
+#define SLAVE_MSG        "This is CC3200 SPI Slave Application\n\r"
+
+//*****************************************************************************
+//                 GLOBAL VARIABLES -- Start
+//*****************************************************************************
+#if defined(ccs)
+extern void (* const g_pfnVectors[])(void);
+#endif
+#if defined(ewarm)
+extern uVectorEntry __vector_table;
+#endif
+// some helpful macros for systick
+
+// the cc3200's fixed clock frequency of 80 MHz
+// note the use of ULL to indicate an unsigned long long constant
+#define SYSCLKFREQ 80000000ULL
+uint32_t button_pressed = 0;
+uint64_t previous = 0;
+// macro to convert ticks to microseconds
+#define TICKS_TO_US(ticks) \
+    ((((ticks) / SYSCLKFREQ) * 1000000ULL) + \
+    ((((ticks) % SYSCLKFREQ) * 1000000ULL) / SYSCLKFREQ))\
+
+// macro to convert microseconds to ticks
+#define US_TO_TICKS(us) ((SYSCLKFREQ / 1000000ULL) * (us))
+
+// systick reload value set to 40ms period
+// (PERIOD_SEC) * (SYSCLKFREQ) = PERIOD_TICKS
+#define SYSTICK_RELOAD_VAL 3200000UL
+int counter = 0;
+int delete = 0;
+int taps;
+int w = -1;
+volatile int cnt = 0;
+
+// track systick counter periods elapsed
+// if it is not 0, we know the transmission ended
+volatile int systick_cnt = 1;
+uint32_t button_0       =     0b11100000111000001000100001110111;
+uint32_t button_1       =     0b11100000111000000010000011011111;
+uint32_t button_2       =     0b11100000111000001010000001011111;
+uint32_t button_3       =     0b11100000111000000110000010011111;
+uint32_t button_4       =     0b11100000111000000001000011101111;
+uint32_t button_5       =     0b11100000111000001001000001101111;
+uint32_t button_6       =     0b11100000111000000101000010101111;
+uint32_t button_7       =     0b11100000111000000011000011001111;
+uint32_t button_8       =     0b11100000111000001011000001001111;
+uint32_t button_9       =     0b11100000111000000111000010001111;
+uint32_t button_MUTE    =     0b11100000111000001111000000001111;
+uint32_t button_LAST    =     0b11100000111000001100100000110111;
+//*****************************************************************************
+//                 GLOBAL VARIABLES -- End
+//*****************************************************************************
+static void BoardInit(void);
+//*****************************************************************************
+
+/**
+ * Reset SysTick Counter
+ */
+static inline void SysTickReset(void) {
+    // any write to the ST_CURRENT register clears it
+    // after clearing it automatically gets reset without
+    // triggering exception logic
+    // see reference manual section 3.2.1
+    HWREG(NVIC_ST_CURRENT) = 1;
+
+    // clear the global count variable
+    systick_cnt = 1;
+}
+
+/**
+ * SysTick Interrupt Handler
+ *
+ * Keep track of whether the systick counter wrapped
+ */
+static void SysTickHandler(void) {
+    // increment every time the systick handler fires
+    systick_cnt++;
+    cnt++;
+}
+void GPIOIntHandler(void)
+{
+    unsigned long status = MAP_GPIOIntStatus(GPIOA1_BASE, true);
+    MAP_GPIOIntClear(GPIOA1_BASE, status);
+    uint64_t delta = SYSTICK_RELOAD_VAL - SysTickValueGet();
+    SysTickReset();
+    systick_cnt = 0;
+    // convert elapsed cycles to microseconds
+    uint64_t delta_us = TICKS_TO_US(delta);
+
+    button_pressed = button_pressed << 1;
+
+    if (delta_us < 2300){ //if detected 1
+        button_pressed++;
+        counter++;
+        }
+    if (delta_us < 1400 ){//if detected 0
+        button_pressed--;
+        }
+    if (counter == 32 ){//once all 32 bits are filled
+        counter = 0;
+        if (cnt < 3){
+            button_pressed = 0;
+        }
+        if (cnt > 25){
+            taps = 0;
+            w++;
+        }
+        cnt = 0;
+    }
+}
+
+void UARTIntHandler(void)
+{
+    unsigned long ulStatus;
+
+    // Check interrupt status
+    ulStatus = MAP_UARTIntStatus(UARTA1_BASE, true);
+
+    // Clear the UART Interrupt
+    MAP_UARTIntClear(UARTA1_BASE, ulStatus);
+
+     // Wait to receive a character over UART
+    while(MAP_UARTCharsAvail(UARTA1_BASE) == true)
+    {
+       char cChar;
+       int iLen = 0;
+       unsigned int uiBufLen = 100;
+       char pcBuffer[uiBufLen];  // Assuming pcBuffer is an array to store received data
+
+       cChar = MAP_UARTCharGetNonBlocking(UARTA1_BASE);
+
+       // Receive data
+       MAP_UARTCharPut(UARTA1_BASE, cChar);
+       iLen = 0;
+
+       // Checking the end of Command
+       while((cChar != '\r') && (cChar !='\n') )
+       {
+           // Handling overflow of buffer
+           if(iLen >= uiBufLen -1) // Considering null-termination character
+           {
+               // Handle buffer overflow error
+               // Clear the buffer and continue receiving
+               break;
+           }
+
+           // Copying Data from UART into a buffer (storage data)
+           if(cChar != '\b')
+           {
+               pcBuffer[iLen] = cChar;
+               iLen++;
+           }
+           else
+           {
+               // Deleting last character when you hit backspace
+               if(iLen)
+               {
+                   iLen--;
+               }
+           }
+
+       // Receive next character
+       cChar = MAP_UARTCharGetNonBlocking(UARTA1_BASE);
+       }
+
+       // Null-terminate the buffer
+       pcBuffer[iLen] = '\0';
+
+       // Process the received command stored in the buffer
+       // Call a function or perform any required operation
+       // Clear the buffer for the next command
+       iLen = 0;
+       memset(pcBuffer, 0, sizeof(pcBuffer));
+    }
+}
+
+
+static void
+BoardInit(void)
+{
+/* In case of TI-RTOS vector table is initialize by OS itself */
+#ifndef USE_TIRTOS
+  //
+  // Set vector table base
+  //
+#if defined(ccs)
+    MAP_IntVTableBaseSet((unsigned long)&g_pfnVectors[0]);
+#endif
+#if defined(ewarm)
+    MAP_IntVTableBaseSet((unsigned long)&__vector_table);
+#endif
+#endif
+    //
+    // Enable Processor
+    //
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+
+    PRCMCC3200MCUInit();
+}
+
+static void SysTickInit(void) {
+
+    // configure the reset value for the systick countdown register
+    MAP_SysTickPeriodSet(SYSTICK_RELOAD_VAL);
+
+    // register interrupts on the systick module
+    MAP_SysTickIntRegister(SysTickHandler);
+
+    // enable interrupts on systick
+    // (trigger SysTickHandler when countdown reaches 0)
+    MAP_SysTickIntEnable();
+
+    // enable the systick module itself
+    MAP_SysTickEnable();
+}
+//*****************************************************************************
+void MasterMain()
+{
+    //
+    // Initialize Board configurations
+    //
+    BoardInit();
+
+    //
+    // Muxing UART and SPI lines.
+    //
+    PinMuxConfig();
+    //
+    // Enable the SPI module clock
+    //
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI,PRCM_RUN_MODE_CLK);
+
+    //UART communication part
+    // Initialising the Terminal.
+    MAP_UARTConfigSetExpClk(UARTA1_BASE,MAP_PRCMPeripheralClockGet(CONSOLE_PERIPH),
+                            UART_BAUD_RATE,
+                            (UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE |
+                            UART_CONFIG_PAR_NONE));
+
+    UARTFIFODisable(UARTA1_BASE);
+
+    // Register interrupt handler for UART
+    MAP_UARTIntRegister(UARTA1_BASE,UARTIntHandler);
+
+    // Configure the UART Tx and Rx FIFO level to 1/8 i.e 2 characters
+    UARTFIFOLevelSet(UARTA1_BASE,UART_FIFO_TX1_8,UART_FIFO_RX1_8);
+
+    unsigned char ulStatus = MAP_UARTIntStatus(UARTA1_BASE, true);
+
+    // Clear the UART Interrupt
+    MAP_UARTIntClear(UARTA1_BASE, ulStatus);
+
+    // Enable done interrupts for uart
+    MAP_UARTIntEnable(UARTA1_BASE,UART_INT_TX);
+    //
+    // Reset the peripheral
+    //
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+
+    // SPI RESET
+    MAP_SPIReset(GSPI_BASE);
+
+    //
+    // Configure SPI interface
+    MAP_SPIConfigSetExpClk(GSPI_BASE,MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+                         SPI_IF_BIT_RATE,SPI_MODE_MASTER,SPI_SUB_MODE_0,
+                         (SPI_SW_CTRL_CS |
+                         SPI_4PIN_MODE |
+                         SPI_TURBO_OFF |
+                         SPI_CS_ACTIVEHIGH |
+                         SPI_WL_8));
+
+        MAP_SPIEnable(GSPI_BASE);
+        Adafruit_Init();
+        fillScreen(0x0000);
+
+        int last_button = 12;
+        int h = 0;
+        int color = 0xFFFF;
+        drawChar(0, 121, 87, color, 0, 1);
+
+        // Enable SysTick
+        SysTickInit();
+
+        //
+        // Register the interrupt handlers
+        //
+        MAP_GPIOIntRegister(GPIOA1_BASE, GPIOIntHandler);
+
+        //
+        // Configure falling edge interrupts
+        //
+        MAP_GPIOIntTypeSet(GPIOA1_BASE, 0x4, GPIO_FALLING_EDGE);
+
+        ulStatus = MAP_GPIOIntStatus (GPIOA1_BASE, false);
+        MAP_GPIOIntClear(GPIOA1_BASE, ulStatus);            // clear interrupts on GPIOA1
+
+
+        // Enable interrupt
+        MAP_GPIOIntEnable(GPIOA1_BASE, 0x4);
+
+        // reset the countdown register
+        SysTickReset();
+        unsigned char princess[23] = {32};
+        int peach[23] = {0xFFFF};
+        int i = -1;
+        while (1) {
+
+            if (w > 23)
+            {
+                w = -1;
+                h++;
+            }
+
+            if(button_pressed == button_0)
+            {
+                w = w + 1;
+                drawChar(5*w, 7*h, 32, color, 0, 1);
+                i++;
+                princess[i] = 32;
+                peach[i] = color;
+                button_pressed = 0;
+            }
+            if (button_pressed == button_1)
+            {
+                if (last_button != 1)
+                {
+                    taps = 0;
+                }
+                taps++;
+                last_button = 1;
+                if (taps == 1)
+                {
+                    color = 0x001F;
+                    drawChar(0, 121, 66, color, 0, 1);
+                    //uart_send_string("Button 1 tapped once.\r\n");
+                    button_pressed = 0;
+
+                }
+                if (taps == 2)
+                {
+                    color = 0x07E0;
+                    drawChar(0, 121, 71, color, 0, 1);
+                    //uart_send_string("Button 1 tapped twice.\r\n");
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    color = 0x07FF;
+                    drawChar(0, 121, 67, color, 0, 1);
+                    //uart_send_string("Button 1 tapped three times.\r\n");
+                    button_pressed = 0;
+                }
+                if (taps == 4)
+                {
+                    color = 0xF800;
+                    drawChar(0, 121, 82, color, 0, 1);
+                    //uart_send_string("Button 1 tapped four times.\r\n");
+                    button_pressed = 0;
+
+                }
+                if (taps == 5)
+                {
+                    color = 0xF81F;
+                    drawChar(0, 121, 77, color, 0, 1);
+                    //uart_send_string("Button 1 tapped five times.\r\n");
+                    button_pressed = 0;
+                }
+                if (taps == 6)
+                {
+                    color = 0xFFE0;
+                    drawChar(0, 121, 89, color, 0, 1);
+                    //uart_send_string("Button 1 tapped six times.\r\n");
+                    button_pressed = 0;
+                }
+                if (taps == 7)
+                {
+                    color = 0xFFFF;
+                    drawChar(0, 121, 87, color, 0, 1);
+                    //uart_send_string("Button 1 tapped seven times.\r\n");
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+
+
+
+
+            if (button_pressed == button_2)
+            {
+                if (last_button != 2)
+                {
+                    taps = 0;
+                    i++;
+                    w = w + 1;
+                }
+                last_button = 2;
+                taps++;
+                if (taps == 1)
+                {
+                    drawChar(5*w, 7*h, 65, color, 0, 1);
+                    princess[i] = 65;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 66, color, 0, 1);
+                    princess[i] = 66;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 67, color, 0, 1);
+                    princess[i] = 67;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_3)
+            {
+                if (last_button != 3)
+                {
+                    taps = 0;
+                    w = w + 1;
+                    i++;
+                }
+                last_button = 3;
+                taps++;
+                if (taps == 1)
+                {
+                    drawChar(5*w, 7*h, 68, color, 0, 1);
+                    princess[i] = 68;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 69, color, 0, 1);
+                    princess[i] = 69;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 70, color, 0, 1);
+                    princess[i] = 70;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_4)
+            {
+                if (last_button != 4)
+                {
+                    i++;
+                    taps = 0;
+                    w = w + 1;
+                }
+                last_button = 4;
+                taps++;
+                if (taps == 1)
+                    {
+                        drawChar(5*w, 7*h, 71, color, 0, 1);
+                        princess[i] = 71;
+                        peach[i] = color;
+                        button_pressed = 0;
+                    }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 72, color, 0, 1);
+                    princess[i] = 72;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 73, color, 0, 1);
+                    princess[i] = 73;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_5)
+            {
+                if (last_button != 5)
+                {
+                    taps = 0;
+                    w = w + 1;
+                    i++;
+                }
+                last_button = 5;
+                taps++;
+                if (taps == 1)
+                    {
+                        drawChar(5*w, 7*h, 74, color, 0, 1);
+                        princess[i] = 74;
+                        peach[i] = color;
+                        button_pressed = 0;
+                    }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 75, color, 0, 1);
+                    princess[i] = 75;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 76, color, 0, 1);
+                    princess[i] = 76;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_6)
+            {
+                if (last_button != 6)
+                {
+                    taps = 0;
+                    w = w + 1;
+                    i++;
+                }
+                last_button = 6;
+                taps++;
+                if (taps == 1)
+                    {
+                        drawChar(5*w, 7*h, 77, color, 0, 1);
+                        princess[i] = 77;
+                        peach[i] = color;
+                        button_pressed = 0;
+                    }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 78, color, 0, 1);
+                    princess[i] = 78;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 79, color, 0, 1);
+                    princess[i] = 79;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_7)
+            {
+                if (last_button != 7)
+                {
+                    i++;
+                    taps = 0;
+                    w++;
+                }
+                last_button = 7;
+                taps++;
+                if (taps == 1)
+                {
+                    drawChar(5*w, 7*h, 80, color, 0, 1);
+                    princess[i] = 80;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 81, color, 0, 1);
+                    princess[i] = 81;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 82, color, 0, 1);
+                    princess[i] = 82;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 4)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 83, color, 0, 1);
+                    princess[i] = 83;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_8)
+            {
+                if (last_button != 8)
+                {
+                    i++;
+                    taps = 0;
+                    w = w + 1;
+                }
+                last_button = 8;
+                taps++;
+                if (taps == 1)
+                {
+                    drawChar(5*w, 7*h, 84, color, 0, 1);
+                    princess[i] = 84;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 85, color, 0, 1);
+                    princess[i] = 85;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 86, color, 0, 1);
+                    princess[i] = 86;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_9)
+            {
+                if (last_button != 9)
+                {
+                    i++;
+                    taps = 0;
+                    w++;
+                }
+                last_button = 9;
+                taps++;
+                if (taps == 1)
+                {
+                    drawChar(5*w, 7*h, 87, color, 0, 1);
+                    princess[i] = 87;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 2)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 88, color, 0, 1);
+                    princess[i] = 88;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 3)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 89, color, 0, 1);
+                    princess[i] = 89;
+                    peach[i] = color;
+                    button_pressed = 0;
+                }
+                if (taps == 4)
+                {
+                    drawChar(5*w, 7*h, 8, color, 0, 1);
+                    drawChar(5*w, 7*h, 90, color, 0, 1);
+                    princess[i] = 90;
+                    peach[i] = color;
+                    button_pressed = 0;
+                    taps = 0;
+                }
+            }
+            if (button_pressed == button_MUTE)
+            {
+                drawChar(5*w, 7*h, 32, color, 0, 1);
+                princess[i] = 32;
+                peach[i] = 0xFFFF;
+                w--;
+                if (w < -1)
+                {
+                    w = -1;
+                    i = 0;
+                }
+                i--;
+                last_button = 10;
+                button_pressed = 0;
+            }
+            if (button_pressed == button_LAST)
+            {
+                int j = 0;
+                last_button = 12;
+                h = h + 2;
+                w = -1;
+                while (j < 24)
+                {
+                    UARTCharPut(UARTA1_BASE, princess[j]);
+                    princess[j] = 32;
+                    j++;
+                }
+                i = -1;
+                h++;
+                button_pressed = 0;
+            }
+
+        }
+
+}
+
+
+//*******************************************************************************
+//**
+int data[23];
+int h, w, z;
+
+void SlaveMain()
+{
+    // Initialize Board configurations
+    //
+    BoardInit();
+
+    //
+    // Muxing UART and SPI lines.
+    //
+    PinMuxConfig();
+    //
+    // Enable the SPI module clock
+    //
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI,PRCM_RUN_MODE_CLK);
+
+
+    //
+    // Reset the peripheral
+    //
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+
+    // SPI RESET
+    MAP_SPIReset(GSPI_BASE);
+
+    //
+    // Configure SPI interface
+    MAP_SPIConfigSetExpClk(GSPI_BASE,MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+                         SPI_IF_BIT_RATE,SPI_MODE_MASTER,SPI_SUB_MODE_0,
+                         (SPI_SW_CTRL_CS |
+                         SPI_4PIN_MODE |
+                         SPI_TURBO_OFF |
+                         SPI_CS_ACTIVEHIGH |
+                         SPI_WL_8));
+
+    MAP_SPIEnable(GSPI_BASE);
+    Adafruit_Init();
+    fillScreen(0x0000);
+
+    //UART communication part
+    // Initialising the Terminal.
+    MAP_UARTConfigSetExpClk(UARTA1_BASE,MAP_PRCMPeripheralClockGet(CONSOLE_PERIPH),
+                            UART_BAUD_RATE,
+                            (UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE |
+                            UART_CONFIG_PAR_NONE));
+
+    UARTFIFODisable(UARTA1_BASE);
+
+    // Register interrupt handler for UART
+    MAP_UARTIntRegister(UARTA1_BASE, UARTIntHandler);
+
+    // Configure the UART Tx and Rx FIFO level to 1/8 i.e 2 characters
+    UARTFIFOLevelSet(UARTA1_BASE,UART_FIFO_TX1_8,UART_FIFO_RX1_8);
+
+    unsigned long ulStatus = MAP_UARTIntStatus(UARTA1_BASE, true);
+
+    // Clear the UART Interrupt
+    MAP_UARTIntClear(UARTA1_BASE, ulStatus);
+
+    // Enable done interrupts for uart
+    MAP_UARTIntEnable(UARTA1_BASE,UART_INT_RX);
+
+    // Wait to receive a character over UART
+   while(UARTCharsAvail(UARTA1_BASE) == false);
+
+   // Receive the character
+   char cChar = UARTCharGetNonBlocking(UARTA1_BASE);
+
+   // Echo the character back to the sender
+   UARTCharPut(UARTA1_BASE, cChar);
+
+   // Process the received command, assuming that the code for processing the command is already implemented
+   // processCommand(cChar);
+
+   // Store the received data in the data array
+   int i = 0;
+   while (UARTCharsAvail(UARTA1_BASE))
+   {
+       data[i] = UARTCharGetNonBlocking(UARTA1_BASE);
+       i++;
+   }
+
+   // Display the data on the OLED display
+   while (z < 24)
+   {
+       drawChar(5*w, 7*h, data[z], 0xFFFF, 0, 1);
+       z++;
+       w++;
+       if (w <= 23 )
+       {
+           w = 0;
+           h++;
+       }
+   }
+
+}
+
+//*******************************************************************************
+void main()
+{
+
+
+#if MASTER_MODE
+
+    MasterMain();
+
+#else
+
+    SlaveMain();
+
+#endif
+    // Loop forever, receiving data from UART
+    while(1)
+    {
+
+    }
+
+}
